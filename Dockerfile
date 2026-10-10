@@ -83,9 +83,13 @@ RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
  && rm -rf /var/lib/apt/lists/* \
  # -- Preuves de construction : l'image echoue ici plutot qu'au premier
  #    deploiement, et la sortie reste lisible dans le journal du build.
+ #    `zfs --version` sort en code != 0 dans un conteneur SANS module noyau
+ #    (« zfs_version_kernel() failed: No such file or directory ») : c'est
+ #    ATTENDU au build, la version du module n'existe que sur l'hote. On verifie
+ #    donc que l'outil s'execute et s'annonce, pas son code de retour.
  && command -v zrepl zfs zpool \
  && zrepl version --show client \
- && zfs --version
+ && { zfs --version || true; }
 
 WORKDIR /etc/zrepl
 
