@@ -1,16 +1,20 @@
 # docker-zrepl
 
-Image conteneur **multi-architecture** de [zrepl](https://zrepl.github.io) —
-solution de sauvegarde et de réplication ZFS (« one-stop ZFS backup &
+Image conteneur **multi-architecture** de [zrepl](https://github.com/dsh2dsh/zrepl)
+— solution de sauvegarde et de réplication ZFS (« one-stop ZFS backup &
 replication »).
 
 | | |
 |---|---|
 | Image | `ghcr.io/jbaptisme33/zrepl` |
 | Architectures | `linux/amd64`, `linux/arm64` (manifeste multi-arch unique) |
-| Version embarquée | zrepl `0.7.0` (amont `zrepl/zrepl`) |
+| Version embarquée | zrepl `1.4.2` — fork **`dsh2dsh/zrepl`** |
 | Base | `ubuntu:22.04` (alignée sur la famille du nœud hôte) |
 | Build | GitHub Actions → `docker buildx` (voir `.github/workflows/build.yml`) |
+
+> **Le conteneur doit être root** et le pod **privilégié**, avec `/dev/zfs` de
+> l'hôte monté. C'est la condition pour ouvrir `/dev/zfs` et pour que les
+> opérations ZFS (`zfs send`/`recv`, propriétés, holds) aboutissent.
 
 ---
 
@@ -29,12 +33,54 @@ GitOps, sans brique shadow.
 
 ---
 
+## Pourquoi `dsh2dsh/zrepl` et pas `zrepl/zrepl`
+
+`zrepl/zrepl` **n'a rien publié depuis mai 2026** : la branche amont est de fait
+dormante. `dsh2dsh/zrepl` partage cet historique mais est **activement maintenu**
+(Go 1.26, dépendances rafraîchies par dependabot, releases régulières) et résout
+une douzaine d'issues amont.
+
+Apports concrets pour un usage WAN (notre cas : home → pair OCI / Tronque) :
+
+| Apport | Effet |
+|---|---|
+| `zfs send -I` en **un seul paquet** (tous les snapshots intermédiaires) au lieu d'un `-i` par snapshot | mesuré par l'auteur : 1m32 au lieu de 8m sur WLAN |
+| `zfs send -R` récursif, `send.raw` (= `-w`) par défaut | moins de code, moins d'échecs |
+| `execpipe` entre `zfs send` et `zfs recv` | permet `zstd \| mbuffer` sur le flux |
+| pruning et snapshotting **concurrents** | plus de purge bloquée derrière un snapshot |
+| `zrepl monitor alive\|snapshots` + endpoint `/health` | surveillance Icinga/Nagios sans sonde maison |
+| intervalle ou **cron** par job de réplication | cadencement fin |
+| `client_keys` par job | restriction d'accès par client nommé |
+
+### ⚠️ Changement cassant de format de configuration
+
+Le passage de `zrepl/zrepl` 0.7 à `dsh2dsh/zrepl` 1.4.2 **n'est pas un simple
+changement de `build-arg`** : la configuration zrepl elle-même change de forme.
+L'API est passée de **gRPC à REST**, et les transports `tcp`/`tls` ont été
+remplacés par `local` et `http`.
+
+| `zrepl/zrepl` 0.7 (avant) | `dsh2dsh/zrepl` 1.4.2 (après) |
+|---|---|
+| `serve:` **par job** (`type: tls`, `ca`, `cert`, `key`, `client_cns`) | un **`listen:` global** unique : `addr: ":5555"`, `tls_cert`, `tls_key`, `zfs: true` |
+| Authentification **mTLS par CN** de certificat client | **jetons** : `include_keys: "keys.yaml"`, `client_keys:` par job, `client_identity` côté client |
+| `connect: { type: tls, address, ca, cert, key, server_cn }` | `connect: { type: http, server: "https://…", listener_name, client_identity }` |
+| `filesystems:` (filtre par préfixe) | `datasets:` (liste de motifs, `recursive`, `exclude`, `shell`) — l'ancien `filesystems:` fonctionne encore mais est **déprécié** |
+| socket de contrôle implicite | déclaré dans `listen:` : `unix: "/var/run/zrepl/control"` + `control: true` |
+| `postgres-checkpoint`, `mysql-lock-tables` | **supprimés** |
+
+Conséquence : **les configurations zrepl doivent être réécrites** au format REST
+avant de faire tourner cette image. Voir `k0s-home/zrepl/values.yaml` du dépôt
+`gitops-manifests`, qui porte la configuration cible (validée par le binaire
+1.4.2 lui-même).
+
+---
+
 ## Ce que contient l'image, et pourquoi
 
-- **Le binaire `zrepl`**, téléchargé depuis la release amont et **vérifié par
-  somme SHA-512** (`sha512sum.txt` de l'amont) pendant le build. Il est
-  **statique** (`CGO_ENABLED=0`, `ldd` répond « not a dynamic executable ») :
-  aucune dépendance libc, aucune compilation nécessaire.
+- **Le binaire `zrepl`**, téléchargé depuis la release `dsh2dsh/zrepl` et
+  **vérifié par somme SHA-256** (`zrepl_<version>_checksums.txt`) pendant le
+  build. Il est **statique** (`ldd` répond « not a dynamic executable ») : aucune
+  dépendance libc, aucune compilation nécessaire.
 - **`zfsutils-linux`** : zrepl n'embarque *pas* de bibliothèque ZFS, il invoque
   les binaires `zfs` et `zpool` du système (`internal/zfs/zfs.go` :
   `ZFS_BINARY = "zfs"`). Sans ces outils, le conteneur démarre puis échoue à la
@@ -44,10 +90,6 @@ GitOps, sans brique shadow.
   `/var/run/zrepl/control` (socket de contrôle) est écrit — à monter en
   `emptyDir` dans le pod.
 
-> **Le conteneur doit être root** et le pod **privilégié**, avec `/dev/zfs` de
-> l'hôte monté. C'est la condition pour ouvrir `/dev/zfs` et pour que les
-> opérations ZFS (`zfs send`/`recv`, propriétés, holds) aboutissent.
-
 ---
 
 ## Utilisation
@@ -56,6 +98,7 @@ GitOps, sans brique shadow.
 docker run --rm --privileged \
   -v /dev/zfs:/dev/zfs \
   -v "$PWD/zrepl.yml:/etc/zrepl/zrepl.yml:ro" \
+  -v "$PWD/keys.yaml:/etc/zrepl/keys.yaml:ro" \
   -v "$PWD/tls:/etc/zrepl/tls:ro" \
   ghcr.io/jbaptisme33/zrepl daemon
 ```
@@ -63,12 +106,13 @@ docker run --rm --privileged \
 - `ENTRYPOINT` = `zrepl --config /etc/zrepl/zrepl.yml`
 - `CMD` = `daemon`
 - Commandes utiles sans lancer le démon :
-  - `... configcheck` — valide le fichier de configuration ;
-  - `... configcheck --skip-cert-check` — idem sans exiger les certificats TLS ;
-  - `... test filesystems --job <job> --all` — **preuve** du périmètre retenu
-    par le filtre d'un job `push`/`source` (applique le filtre et rend
-    `ACCEPT`/`REJECT` par jeu de données) ;
-  - `... version --show client` — version du binaire.
+  - `... configcheck` — valide le fichier de configuration (code 0 si valide) ;
+  - `... configcheck --what jobs --format yaml` — rend la configuration
+    **interprétée** (ce que le démon a réellement compris) ;
+  - `... test filesystems --job <job> --all` — **preuve** du périmètre retenu par
+    le filtre `datasets:` d'un job `push`/`source` ;
+  - `... version --show client` — version du binaire ;
+  - `... monitor alive` / `... monitor snapshots` — contrôles Icinga/Nagios.
 
 ---
 
@@ -88,7 +132,7 @@ gh run list -R JBaptisme33/docker-zrepl -L 5
 En local, pour reproduire une seule architecture (nécessite un démon Docker) :
 
 ```bash
-docker build --build-arg ZREPL_VERSION=0.7.0 -t zrepl:local .
+docker build --build-arg ZREPL_VERSION=1.4.2 -t zrepl:local .
 ```
 
 ### Faire évoluer la version de zrepl
@@ -97,31 +141,15 @@ La version est déclarée **une seule fois** dans le workflow
 (`env.ZREPL_VERSION`) ; elle sert à la fois de `build-arg` et de **tag d'image**,
 donc les deux ne peuvent pas diverger. Bumper = un commit sur ce fichier :
 
-1. vérifier que la release amont publie bien `zrepl-linux-amd64` et
-   `zrepl-linux-arm64` (`gh release view -R zrepl/zrepl`) ;
+1. vérifier que la release du fork publie bien les deux architectures :
+   `gh release view -R dsh2dsh/zrepl` doit lister
+   `zrepl_<version>_linux_amd64.tar.gz` **et** `zrepl_<version>_linux_arm64.tar.gz` ;
 2. changer `ZREPL_VERSION` dans `.github/workflows/build.yml` ;
 3. pousser — l'image `<version>` et `latest` sont reconstruites.
 
 Ensuite, côté `gitops-manifests`, épingler le même tag dans
 `k0s-home/zrepl/values.yaml` (champ `image.tag`) **et** dans `appVersion` du
-chart.
-
----
-
-## Variante : la branche `dsh2dsh/zrepl`
-
-`dsh2dsh/zrepl` est un dépôt **autonome** (pas un fork GitHub) qui partage
-l'historique amont mais est **nettement plus actif** que `zrepl/zrepl` (dont la
-dernière publication date de mai 2026). Il conserve le modèle multi-destination
-de l'amont et change l'architecture (API REST, `keys.yaml` au lieu de mTLS
-`serv:`).
-
-Pour construire l'image depuis cette branche, **la nomenclature des assets
-diffère** : `zrepl_<version>_linux_<arch>.tar.gz` (archive) au lieu de
-`zrepl-linux-<arch>` (binaire nu). Le `Dockerfile` de ce dépôt suit la
-nomenclature amont ; passer à `dsh2dsh` demande d'adapter l'étape de
-téléchargement (extraire l'archive) **et** de réécrire les configurations zrepl
-au format REST. Ce n'est donc pas un simple changement de `build-arg`.
+chart. **Ne jamais désaligner les trois.**
 
 ---
 
@@ -135,9 +163,15 @@ au format REST. Ce n'est donc pas un simple changement de `build-arg`.
   noyau** de l'hôte. L'image est alignée sur Ubuntu 22.04 (`zfsutils-linux`
   2.1.x) parce que le nœud `k3s-home` est en Ubuntu 22.04.5. Pour un hôte d'une
   autre famille, surcharger `BASE_IMAGE` (build-arg).
-- **Les certificats TLS ne sont pas dans l'image** : ils vivent sur l'hôte et
-  doivent être fournis au pod par un Secret Kubernetes (voir le chart
-  `k0s-home/zrepl` du dépôt `gitops-manifests`).
+- **Les secrets ne sont pas dans l'image** : les certificats TLS
+  (`listen.tls_cert`/`tls_key`) **et** le fichier de jetons `keys.yaml` vivent
+  hors de l'image et doivent être fournis au pod par des Secrets Kubernetes
+  (voir le chart `k0s-home/zrepl` du dépôt `gitops-manifests`).
+- **Modèle d'authentification par jeton, pas par certificat client.** Là où
+  l'amont liait l'identité au **CN** d'un certificat client, le fork authentifie
+  par **jeton partagé** (`keys.yaml`). Un jeton vaut donc une identité : il doit
+  circuler sur un transport chiffré (`https://`), et chaque hôte détient
+  nécessairement les jetons des deux sens de la réplication croisée.
 
 ---
 

@@ -2,11 +2,13 @@
 #  Build & push de l'image zrepl — linux/amd64 + linux/arm64
 # =============================================================================
 #  Une seule image, deux architectures : le manifeste multi-arch est pousse sur
-#  GHCR. Le binaire zrepl etant statique et publie par l'amont pour les deux
-#  architectures, il n'y a ni QEMU ni cross-compilation a mettre en place.
+#  GHCR. Le binaire zrepl (dsh2dsh/zrepl) etant statique et publie par le fork
+#  pour les deux architectures, il n'y a ni QEMU ni cross-compilation a mettre
+#  en place.
 #
 #  Publiee sur : ghcr.io/jbaptisme33/zrepl
-#  Tags         : <version zrepl> (ex. 0.7.0), latest (branche par defaut), sha-<court>
+#  Tags         : <version zrepl> (ex. 1.4.2), latest (branche par defaut),
+#                 sha-<court>
 #
 #  La version de zrepl est declaree UNE SEULE FOIS (env.ZREPL_VERSION), et sert
 #  a la fois de build-arg et de tag d'image : les deux ne peuvent pas diverger.
@@ -27,9 +29,9 @@ permissions:
 
 env:
   # -- Version de zrepl embarquee. Bump = un commit ici (voir README).
-  ZREPL_VERSION: "0.7.0"
-  # -- Depot amont du binaire.
-  ZREPL_REPO: zrepl/zrepl
+  ZREPL_VERSION: "1.4.2"
+  # -- Depot du binaire : dsh2dsh/zrepl, fork activement maintenu de zrepl/zrepl.
+  ZREPL_REPO: dsh2dsh/zrepl
   IMAGE: ghcr.io/jbaptisme33/zrepl
 
 jobs:
