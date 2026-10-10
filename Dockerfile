@@ -3,6 +3,8 @@
 # =============================================================================
 #  zrepl — image conteneur multi-architecture (linux/amd64 + linux/arm64)
 # =============================================================================
+#  BINAIRE : dsh2dsh/zrepl, fork activement maintenu de zrepl/zrepl.
+#
 #  POURQUOI CETTE IMAGE EXISTE
 #  ---------------------------
 #  zrepl tourne aujourd'hui sur les hotes, installe par le systeme, avec un
@@ -11,12 +13,32 @@
 #  de le deployer comme une release Helm (DaemonSet privilegie qui monte
 #  /dev/zfs de l'hote), donc de supprimer cette brique shadow.
 #
+#  POURQUOI dsh2dsh/zrepl ET PAS zrepl/zrepl
+#  -----------------------------------------
+#  zrepl/zrepl n'a rien publie depuis mai 2026 : la branche amont est de fait
+#  dormante. dsh2dsh/zrepl partage cet historique mais est activement maintenu
+#  (Go 1.26, dependances fraiches, releases regulieres). Il corrige une
+#  douzaine d'issues amont et apporte des gains concrets en replication WAN :
+#
+#    * `zfs send -I` en un seul paquet (tous les snapshots intermediaires) au
+#      lieu d'un `-i` par snapshot — determinante sur un lien WAN ;
+#    * `zfs send -R` recursif, `send.raw` (= -w) par defaut ;
+#    * pipelines entre send et recv (`execpipe` : zstd | mbuffer) ;
+#    * pruning et snapshotting concurrents ;
+#    * surveillance Icinga/Nagios integree (`zrepl monitor`).
+#
+#  ATTENTION : c'est un CHANGEMENT CASSANT de format de configuration.
+#  L'API est passee de gRPC a REST et les transports `tcp`/`tls` (mTLS par CN)
+#  ont ete remplaces par `local` et `http` (jetons via `keys.yaml`). Les blocs
+#  `serve:` par job n'existent plus : le service est declare une fois, dans un
+#  `listen:` global. Voir le README pour la table de correspondance.
+#
 #  POURQUOI IL N'Y A RIEN A COMPILER
 #  ---------------------------------
-#  L'amont publie zrepl sous forme de binaire Go STATIQUE (build `CGO_ENABLED=0`,
-#  verifie : `ldd` repond « not a dynamic executable »). Il n'y a donc pas de
-#  cross-compilation a faire : on telecharge le binaire de l'architecture cible.
-#  C'est ce qui rend le multi-arch trivial — ni QEMU, ni toolchain Go.
+#  Le fork publie zrepl sous forme de binaire Go STATIQUE (verifie : `ldd`
+#  repond « not a dynamic executable »). Il n'y a donc pas de cross-compilation
+#  a faire : on telecharge le binaire de l'architecture cible. C'est ce qui
+#  rend le multi-arch trivial — ni QEMU, ni toolchain Go.
 #
 #  CE QUE L'IMAGE DOIT CONTENIR, ET POURQUOI
 #  -----------------------------------------
@@ -36,16 +58,15 @@ ARG BASE_IMAGE=ubuntu:22.04
 FROM ${BASE_IMAGE}
 
 # -- Version de zrepl a embarquer : LA valeur a faire evoluer (voir README).
-ARG ZREPL_VERSION=0.7.0
-# -- Depot amont. Passer a `dsh2dsh/zrepl` pour la branche activement maintenue
-#    (nomenclature d'assets differente : voir README, section « Variante »).
-ARG ZREPL_REPO=zrepl/zrepl
+ARG ZREPL_VERSION=1.4.2
+# -- Depot du binaire : dsh2dsh/zrepl, fork activement maintenu.
+ARG ZREPL_REPO=dsh2dsh/zrepl
 # -- Architecture cible, fournie par buildx (amd64 | arm64).
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="zrepl" \
-      org.opencontainers.image.description="One-stop ZFS backup & replication — binaire statique + outils ZFS en espace utilisateur" \
-      org.opencontainers.image.url="https://zrepl.github.io" \
+      org.opencontainers.image.description="One-stop ZFS backup & replication — binaire statique (dsh2dsh/zrepl) + outils ZFS en espace utilisateur" \
+      org.opencontainers.image.url="https://github.com/dsh2dsh/zrepl" \
       org.opencontainers.image.source="https://github.com/${ZREPL_REPO}" \
       org.opencontainers.image.version="${ZREPL_VERSION}" \
       org.opencontainers.image.licenses="MIT"
@@ -62,21 +83,30 @@ RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
       ca-certificates \
       curl \
       zfsutils-linux \
- # -- Binaire zrepl + verrou d'integrite. Le fichier de sommes amont est au
- #    format `sha512sum` standard (`<hash>  <nom>`) ; on ne verifie QUE la ligne
- #    de l'architecture cible, les autres assets n'etant pas telecharges.
- && curl -fsSL -o "/tmp/zrepl-linux-${TARGETARCH}" \
-      "https://github.com/${ZREPL_REPO}/releases/download/v${ZREPL_VERSION}/zrepl-linux-${TARGETARCH}" \
- && curl -fsSL -o /tmp/sha512sum.txt \
-      "https://github.com/${ZREPL_REPO}/releases/download/v${ZREPL_VERSION}/sha512sum.txt" \
+ # -- Binaire zrepl + verrou d'integrite. La nomenclature du fork est
+ #    `zrepl_<version>_linux_<arch>.tar.gz` (une ARCHIVE, pas un binaire nu), et
+ #    le fichier de sommes est en SHA-256 (`zrepl_<version>_checksums.txt`,
+ #    format `sha256sum` standard `<hash>  <nom>`). On ne verifie QUE la ligne de
+ #    l'architecture cible : les autres assets ne sont pas telecharges.
+ && curl -fsSL -o "/tmp/zrepl_${ZREPL_VERSION}_linux_${TARGETARCH}.tar.gz" \
+      "https://github.com/${ZREPL_REPO}/releases/download/v${ZREPL_VERSION}/zrepl_${ZREPL_VERSION}_linux_${TARGETARCH}.tar.gz" \
+ && curl -fsSL -o /tmp/checksums.txt \
+      "https://github.com/${ZREPL_REPO}/releases/download/v${ZREPL_VERSION}/zrepl_${ZREPL_VERSION}_checksums.txt" \
+ # -- Le nom du fichier telecharge DOIT etre celui de l'asset : `sha256sum -c`
+ #    resout chaque ligne du fichier de sommes comme un NOM DE FICHIER local.
+ #    Un nom different fait echouer la verification (« FAILED open or read »).
  && ( cd /tmp \
-      && grep -E "  zrepl-linux-${TARGETARCH}\$" sha512sum.txt \
-      && grep -E "  zrepl-linux-${TARGETARCH}\$" sha512sum.txt | sha512sum -c - ) \
- && install -m 0755 "/tmp/zrepl-linux-${TARGETARCH}" /usr/local/bin/zrepl \
- && rm -f /tmp/zrepl-linux-* /tmp/sha512sum.txt \
+      && grep -E "  zrepl_${ZREPL_VERSION}_linux_${TARGETARCH}\.tar\.gz\$" checksums.txt \
+      && grep -E "  zrepl_${ZREPL_VERSION}_linux_${TARGETARCH}\.tar\.gz\$" checksums.txt | sha256sum -c - ) \
+ # -- L'archive contient `zrepl` a la racine (plus dist/ pour FreeBSD et un
+ #    tableau de bord Grafana). On n'installe QUE le binaire.
+ && tar -xzf "/tmp/zrepl_${ZREPL_VERSION}_linux_${TARGETARCH}.tar.gz" -C /tmp zrepl \
+ && install -m 0755 /tmp/zrepl /usr/local/bin/zrepl \
+ && rm -rf "/tmp/zrepl_${ZREPL_VERSION}_linux_${TARGETARCH}.tar.gz" /tmp/checksums.txt /tmp/zrepl \
  # -- Repertoire du socket de controle. zrepl ne stocke AUCUN etat sur disque :
  #    les curseurs de replication sont des proprietes ZFS (`zrepl:cursor`).
- #    Seul /var/run/zrepl/control est ecrit — monte en emptyDir dans le pod.
+ #    Seul /var/run/zrepl/control est ecrit — monte en emptyDir dans le pod, et
+ #    declare dans le `listen:` de la configuration (`unix:` + `control: true`).
  && install -d -m 0700 /var/run/zrepl \
  && install -d -m 0755 /etc/zrepl \
  && apt-get purge -y --auto-remove curl \
